@@ -74,7 +74,7 @@ MMMU_SUBJECTS = [
 # ════════════════════════════════════════════════════════════════
 
 def load_model_and_processor(model_type, model_path, cache_dir="./checkpoints",
-                             revision=None):
+                             revision=None, max_pixels=401408):
     """Load model + processor.  Always uses eager attention (required for
     FastV attention-weight extraction and for the attention analysis)."""
     print(f"Loading {model_type} model: {model_path}")
@@ -88,8 +88,18 @@ def load_model_and_processor(model_type, model_path, cache_dir="./checkpoints",
             device_map="auto",
             cache_dir=cache_dir,
         )
+        # Cap image resolution to avoid OOM in the vision encoder.
+        # With eager attention the vision encoder materializes the full
+        # [num_patches × num_patches × num_heads] attention matrix in float32.
+        # Large MMMU diagrams can produce 27K+ patches → 45 GB just for softmax.
+        #
+        # max_pixels=401408 ≈ 634×634 image → ~4096 total patches (with
+        # temporal=2) → attention ~1 GB per vision block. Safe on 80 GB GPU.
+        # Lower this further if you still OOM (try 256*28*14*14 = 140672).
         processor = AutoProcessor.from_pretrained(
             model_path, cache_dir=cache_dir,
+            min_pixels=4 * 28 * 28,
+            max_pixels=max_pixels,
         )
 
     elif model_type == "llava":
@@ -422,7 +432,7 @@ def estimate_token_counts(model, processor, model_type, samples,
 def run_sweep(args):
     model, processor = load_model_and_processor(
         args.model_type, args.model_path, args.cache_dir,
-        getattr(args, "revision", None),
+        getattr(args, "revision", None), getattr(args, "max_pixels", 401408),
     )
     out_dir = Path(args.results_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -500,7 +510,7 @@ def run_sweep(args):
 def run_latency(args):
     model, processor = load_model_and_processor(
         args.model_type, args.model_path, args.cache_dir,
-        getattr(args, "revision", None),
+        getattr(args, "revision", None), getattr(args, "max_pixels", 401408),
     )
     out_dir = Path(args.results_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -660,7 +670,7 @@ def _get_token_categories(input_ids, model_type, model, processor,
 def run_attention_analysis(args):
     model, processor = load_model_and_processor(
         args.model_type, args.model_path, args.cache_dir,
-        getattr(args, "revision", None),
+        getattr(args, "revision", None), getattr(args, "max_pixels", 401408),
     )
     out_dir = Path(args.results_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -806,6 +816,8 @@ def main():
     parser.add_argument("--cache_dir", default="./checkpoints")
     parser.add_argument("--data_dir", default="./data")
     parser.add_argument("--results_dir", default="./fastv_results")
+    parser.add_argument("--max_pixels", type=int, default=401408,
+                        help="Max image pixels for Qwen2-VL (lower to avoid OOM with eager attn)")
 
     sub = parser.add_subparsers(dest="experiment", required=True)
 
