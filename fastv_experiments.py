@@ -97,7 +97,8 @@ def load_model_and_processor(model_type, model_path, cache_dir="./checkpoints",
         kwargs = {}
         if revision:
             kwargs["revision"] = revision
-        # Load WITHOUT fastv_config first; we set it dynamically later
+        # Load model; fastv_config defaults to None in LlavaConfig.
+        # We set it dynamically via set_fastv_params before each config.
         model = LlavaForConditionalGeneration.from_pretrained(
             model_path,
             attn_implementation="eager",
@@ -106,9 +107,24 @@ def load_model_and_processor(model_type, model_path, cache_dir="./checkpoints",
             cache_dir=cache_dir,
             **kwargs,
         )
-        processor = AutoProcessor.from_pretrained(
-            model_path, cache_dir=cache_dir, **kwargs,
-        )
+        # The HF processor config for llava-1.5 now contains kwargs
+        # (image_token, patch_size, etc.) that older transformers doesn't
+        # understand.  Fall back to building it from tokenizer + image_processor.
+        try:
+            processor = AutoProcessor.from_pretrained(
+                model_path, cache_dir=cache_dir, **kwargs,
+            )
+        except TypeError:
+            from transformers import AutoTokenizer, AutoImageProcessor, LlavaProcessor
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path, cache_dir=cache_dir, **kwargs,
+            )
+            image_processor = AutoImageProcessor.from_pretrained(
+                model_path, cache_dir=cache_dir, **kwargs,
+            )
+            processor = LlavaProcessor(
+                tokenizer=tokenizer, image_processor=image_processor,
+            )
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -131,14 +147,10 @@ def set_fastv_params(model, model_type, K, R_prune):
 
     elif model_type == "llava":
         if R_prune == 0.0:
-            # Baseline: disable FastV
-            model.config.fastv_config = {
-                "use_fastv": False,
-                "fastv_k": 0,
-                "fastv_r": 0.0,
-                "image_token_start_index": 0,
-                "image_token_length": 576,
-            }
+            # Baseline: set to None so model uses regular forward path
+            # (setting a dict with use_fastv=False still routes to fastv_forward
+            # which has bugs when K=0)
+            model.config.fastv_config = None
         else:
             # LLaVA FastV uses prune-ratio directly (matching paper)
             model.config.fastv_config = {
@@ -153,7 +165,7 @@ def set_fastv_params(model, model_type, K, R_prune):
 def _update_llava_image_range(model, input_ids, processor):
     """Dynamically set image_token_start_index and image_token_length for LLaVA
     by scanning the actual input_ids."""
-    if not hasattr(model.config, "fastv_config"):
+    if not getattr(model.config, "fastv_config", None):
         return
     img_tok_id = getattr(model.config, "image_token_index",
                          processor.tokenizer.convert_tokens_to_ids("<image>"))
@@ -172,7 +184,7 @@ def load_aokvqa(num_samples=None, cache_dir="./data"):
     from datasets import load_dataset
     print("Loading A-OKVQA …")
     ds = load_dataset("HuggingFaceM4/A-OKVQA", split="validation",
-                      cache_dir=cache_dir, trust_remote_code=True)
+                      cache_dir=cache_dir)
     samples = []
     for item in ds:
         choices = item["choices"]
@@ -204,10 +216,15 @@ def load_mmmu(num_samples=None, cache_dir="./data"):
     for subj in MMMU_SUBJECTS:
         try:
             ds = load_dataset("MMMU/MMMU", subj, split="validation",
-                              cache_dir=cache_dir, trust_remote_code=True)
+                              cache_dir=cache_dir)
             all_ds.append(ds)
-        except Exception as e:
-            print(f"  Warning: failed to load MMMU/{subj}: {e}")
+        except Exception:
+            try:
+                ds = load_dataset("MMMU/MMMU", subj, split="validation",
+                                  cache_dir=cache_dir, trust_remote_code=True)
+                all_ds.append(ds)
+            except Exception as e:
+                print(f"  Warning: failed to load MMMU/{subj}: {e}")
     if not all_ds:
         print("  ERROR: Could not load any MMMU subjects!")
         return []
@@ -343,9 +360,11 @@ def evaluate(model, processor, model_type, samples, max_new_tokens=10,
 def compute_flops(model_config, n_total, n_img, K, R_prune):
     """Return (flops_baseline, flops_fastv, flops_ratio).
     All in units of FLOPs (not GFLOPs)."""
-    d = model_config.hidden_size
-    m = model_config.intermediate_size
-    T = model_config.num_hidden_layers
+    # For composite configs (LLaVA), the LLM params live in text_config
+    cfg = getattr(model_config, "text_config", model_config)
+    d = cfg.hidden_size
+    m = cfg.intermediate_size
+    T = cfg.num_hidden_layers
 
     def layer_flops(n):
         return 4 * n * d**2 + 2 * n**2 * d + 2 * n * d * m
@@ -365,20 +384,34 @@ def compute_flops(model_config, n_total, n_img, K, R_prune):
 
 def estimate_token_counts(model, processor, model_type, samples,
                           max_count=50):
-    """Estimate average (n_total, n_img) from a few samples."""
+    """Estimate average (n_total, n_img) from a few samples.
+    For LLaVA, account for the fact that the tokenizer produces a single
+    <image> placeholder that gets expanded to 576 tokens inside the model."""
     n_totals, n_imgs = [], []
     for s in samples[:max_count]:
         inputs, _ = prepare_inputs(model, processor, model_type,
                                    s["image"], s["question"], s["options_str"])
         ids = inputs["input_ids"][0]
-        n_totals.append(len(ids))
+
         if model_type == "qwen2vl":
+            # Qwen2-VL processor already expands image tokens
             img_id = model.config.image_token_id
-            n_imgs.append((ids == img_id).sum().item())
+            n_img = (ids == img_id).sum().item()
+            n_totals.append(len(ids))
+            n_imgs.append(n_img)
         elif model_type == "llava":
+            # LLaVA tokenizer keeps <image> as 1 token; the model expands it
+            # to 576 image embeddings internally. Adjust counts accordingly.
             img_id = getattr(model.config, "image_token_index",
                              processor.tokenizer.convert_tokens_to_ids("<image>"))
-            n_imgs.append((ids == img_id).sum().item())
+            num_placeholders = (ids == img_id).sum().item()
+            llava_img_tokens = 576  # standard LLaVA-1.5 with 336×336 → 576 tokens
+            n_img = num_placeholders * llava_img_tokens
+            # Total = original - placeholders + expanded
+            n_total = len(ids) - num_placeholders + n_img
+            n_totals.append(n_total)
+            n_imgs.append(n_img)
+
     return int(np.mean(n_totals)), int(np.mean(n_imgs))
 
 
@@ -558,35 +591,69 @@ def run_latency(args):
 # 9. EXPERIMENT: ATTENTION PATTERN ANALYSIS  (Paper §3, Fig 3-4)
 # ════════════════════════════════════════════════════════════════
 
-def _get_token_categories(input_ids, model_type, model, processor):
+def _get_token_categories(input_ids, model_type, model, processor,
+                          expanded_seq_len=None):
     """Return dict mapping category name → list of token indices.
-    Categories: 'pre_image', 'image', 'post_image'."""
+    Categories: 'pre_image', 'image', 'post_image'.
+
+    For LLaVA, the tokenizer produces 1 <image> placeholder, but the model
+    internally expands it to 576 tokens. When expanded_seq_len is provided
+    (from attention output shapes), we compute categories in expanded space.
+    """
     ids = input_ids[0]  # [seq_len]
 
     if model_type == "qwen2vl":
+        # Qwen2-VL processor already has expanded image tokens in input_ids
         img_id = model.config.image_token_id
         vid_id = getattr(model.config, "video_token_id", -1)
         is_vision = (ids == img_id) | (ids == vid_id)
+
+        vision_pos = is_vision.nonzero(as_tuple=True)[0]
+        if len(vision_pos) == 0:
+            return {"pre_image": list(range(len(ids))),
+                    "image": [], "post_image": []}
+        img_start = vision_pos[0].item()
+        img_end = vision_pos[-1].item() + 1
+        return {
+            "pre_image":  list(range(0, img_start)),
+            "image":      list(range(img_start, img_end)),
+            "post_image": list(range(img_end, len(ids))),
+        }
+
     elif model_type == "llava":
+        # LLaVA: find the single <image> placeholder in tokenized input_ids
         img_id = getattr(model.config, "image_token_index",
                          processor.tokenizer.convert_tokens_to_ids("<image>"))
-        is_vision = (ids == img_id)
+        positions = (ids == img_id).nonzero(as_tuple=True)[0]
+        if len(positions) == 0:
+            total = expanded_seq_len if expanded_seq_len else len(ids)
+            return {"pre_image": list(range(total)),
+                    "image": [], "post_image": []}
+
+        placeholder_pos = positions[0].item()
+        llava_img_tokens = 576  # LLaVA-1.5 standard
+
+        if expanded_seq_len:
+            # Work in expanded space (for attention analysis)
+            # Before <image>: positions 0..placeholder_pos-1
+            # Image tokens:   positions placeholder_pos..placeholder_pos+576-1
+            # After <image>:  the remaining text tokens
+            img_start = placeholder_pos
+            img_end = placeholder_pos + llava_img_tokens
+            return {
+                "pre_image":  list(range(0, img_start)),
+                "image":      list(range(img_start, img_end)),
+                "post_image": list(range(img_end, expanded_seq_len)),
+            }
+        else:
+            # Pre-expansion space (for token counting etc.)
+            return {
+                "pre_image":  list(range(0, placeholder_pos)),
+                "image":      list(range(placeholder_pos, placeholder_pos + 1)),
+                "post_image": list(range(placeholder_pos + 1, len(ids))),
+            }
     else:
         raise ValueError(model_type)
-
-    vision_pos = is_vision.nonzero(as_tuple=True)[0]
-    if len(vision_pos) == 0:
-        return {"pre_image": list(range(len(ids))),
-                "image": [], "post_image": []}
-
-    img_start = vision_pos[0].item()
-    img_end = vision_pos[-1].item() + 1
-
-    return {
-        "pre_image":  list(range(0, img_start)),
-        "image":      list(range(img_start, img_end)),
-        "post_image": list(range(img_end, len(ids))),
-    }
 
 
 @torch.no_grad()
@@ -605,7 +672,8 @@ def run_attention_analysis(args):
     if not samples:
         print("No samples!"); return
 
-    num_layers = model.config.num_hidden_layers
+    cfg = getattr(model.config, "text_config", model.config)
+    num_layers = cfg.num_hidden_layers
     # Accumulators: sum of attention allocation per layer per category
     alloc_sums = {cat: np.zeros(num_layers)
                   for cat in ["pre_image", "image", "post_image"]}
@@ -623,11 +691,6 @@ def run_attention_analysis(args):
                 model, processor, args.model_type,
                 s["image"], s["question"], s["options_str"],
             )
-            categories = _get_token_categories(
-                inputs["input_ids"], args.model_type, model, processor
-            )
-            if len(categories["image"]) == 0:
-                continue
 
             # For Qwen2-VL, compute proper 3D position_ids
             extra_kwargs = {}
@@ -647,6 +710,17 @@ def run_attention_analysis(args):
                 output_attentions=True,
                 return_dict=True,
             )
+
+            # Get the actual (possibly expanded) sequence length from attention
+            # For LLaVA: tokenizer has ~69 tokens, but model expands to ~644
+            expanded_seq_len = outputs.attentions[0].shape[-1]
+
+            categories = _get_token_categories(
+                inputs["input_ids"], args.model_type, model, processor,
+                expanded_seq_len=expanded_seq_len,
+            )
+            if len(categories["image"]) == 0:
+                continue
 
             # outputs.attentions: tuple of [bsz, num_heads, seq_len, seq_len]
             for layer_idx, attn in enumerate(outputs.attentions):
