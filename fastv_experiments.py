@@ -172,18 +172,31 @@ def set_fastv_params(model, model_type, K, R_prune):
             }
 
 
+# def _update_llava_image_range(model, input_ids, processor):
+#     """Dynamically set image_token_start_index and image_token_length for LLaVA
+#     by scanning the actual input_ids."""
+#     if not getattr(model.config, "fastv_config", None):
+#         return
+#     img_tok_id = getattr(model.config, "image_token_index",
+#                          processor.tokenizer.convert_tokens_to_ids("<image>"))
+#     positions = (input_ids[0] == img_tok_id).nonzero(as_tuple=True)[0]
+#     if len(positions) > 0:
+#         model.config.fastv_config["image_token_start_index"] = positions[0].item()
+#         model.config.fastv_config["image_token_length"] = len(positions)
 def _update_llava_image_range(model, input_ids, processor):
-    """Dynamically set image_token_start_index and image_token_length for LLaVA
-    by scanning the actual input_ids."""
     if not getattr(model.config, "fastv_config", None):
         return
     img_tok_id = getattr(model.config, "image_token_index",
                          processor.tokenizer.convert_tokens_to_ids("<image>"))
     positions = (input_ids[0] == img_tok_id).nonzero(as_tuple=True)[0]
     if len(positions) > 0:
-        model.config.fastv_config["image_token_start_index"] = positions[0].item()
-        model.config.fastv_config["image_token_length"] = len(positions)
-
+        num_placeholders = len(positions)
+        first_pos = positions[0].item()
+        # LLaVA-1.5: each <image> placeholder expands to 576 patch embeddings
+        # (336px / 14px_patch = 24 patches per side, 24*24 = 576)
+        num_image_patches = 576
+        model.config.fastv_config["image_token_start_index"] = first_pos
+        model.config.fastv_config["image_token_length"] = num_placeholders * num_image_patches
 
 # ════════════════════════════════════════════════════════════════
 # 3. DATASET LOADING
