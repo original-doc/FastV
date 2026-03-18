@@ -1010,7 +1010,12 @@ class LlamaModel(LlamaPreTrainedModel):
 
                 # Keep top-scoring image tokens
                 num_keep = round(FASTV_image_token_length * (1 - FASTV_r))
-                top_indices = img_attn.topk(num_keep).indices + FASTV_image_token_start_index
+                # ── Random vs attention-based pruning (ablation) ──
+                if fastv_config.get("random_pruning", False):
+                    perm = torch.randperm(FASTV_image_token_length, device=device)[:num_keep]
+                    top_indices = perm + FASTV_image_token_start_index
+                else:
+                    top_indices = img_attn.topk(num_keep).indices + FASTV_image_token_start_index
 
                 # Build sorted keep indices: [pre-image] + [kept image] + [post-image]
                 keep_indices = torch.cat([

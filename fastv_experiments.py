@@ -143,23 +143,24 @@ def load_model_and_processor(model_type, model_path, cache_dir="./checkpoints",
     return model, processor
 
 
-def set_fastv_params(model, model_type, K, R_prune):
+def set_fastv_params(model, model_type, K, R_prune, random_pruning=False):
     """Configure FastV at runtime.
 
-    K       – layer index at which to prune (paper convention)
-    R_prune – fraction of vision tokens to PRUNE (paper convention).
-              0.0 = baseline, 0.5 = prune half, 0.9 = prune 90%.
+    K               – layer index at which to prune (paper convention)
+    R_prune         – fraction of vision tokens to PRUNE (paper convention).
+                      0.0 = baseline, 0.5 = prune half, 0.9 = prune 90%.
+    random_pruning  – if True, prune randomly instead of by attention rank
+                      (for ablation study, Paper Table 7 row c).
     """
     if model_type == "qwen2vl":
         # Our Qwen2-VL implementation uses keep-ratio
         model.config.fastv_k = K
         model.config.fastv_r = 1.0 - R_prune          # keep ratio
+        model.config.fastv_random_pruning = random_pruning
 
     elif model_type == "llava":
         if R_prune == 0.0:
             # Baseline: set to None so model uses regular forward path
-            # (setting a dict with use_fastv=False still routes to fastv_forward
-            # which has bugs when K=0)
             model.config.fastv_config = None
         else:
             # LLaVA FastV uses prune-ratio directly (matching paper)
@@ -169,6 +170,7 @@ def set_fastv_params(model, model_type, K, R_prune):
                 "fastv_r": R_prune,
                 "image_token_start_index": 5,     # updated per-sample below
                 "image_token_length": 576,         # updated per-sample below
+                "random_pruning": random_pruning,
             }
 
 
@@ -283,6 +285,45 @@ def load_mmmu(num_samples=None, cache_dir="./data"):
         idxs = rng.choice(len(samples), num_samples, replace=False)
         samples = [samples[i] for i in idxs]
     print(f"  Loaded {len(samples)} MMMU samples (MC only)")
+    return samples
+
+
+def load_sciqa(num_samples=None, cache_dir="./data"):
+    """Load ScienceQA image-subset validation set (multiple-choice).
+    Corresponds to SciQA-IMG in the FastV paper (Table 2)."""
+    from datasets import load_dataset
+    print("Loading ScienceQA (image subset) …")
+    ds = load_dataset("derek-thomas/ScienceQA", split="validation",
+                      cache_dir=cache_dir)
+    samples = []
+    for item in ds:
+        # Only keep samples that have an image
+        image = item.get("image")
+        if image is None:
+            continue
+        choices = item["choices"]
+        correct_idx = item["answer"]
+        answer_letter = chr(ord("A") + correct_idx)
+        options_str = "  ".join(
+            f"{chr(ord('A') + i)}. {c}" for i, c in enumerate(choices)
+        )
+        q = item["question"]
+        # Prepend the lecture/hint if present for richer context
+        hint = item.get("hint", "")
+        if hint:
+            q = f"{hint}\n{q}"
+        samples.append({
+            "image": image.convert("RGB"),
+            "question": q,
+            "options_str": options_str,
+            "answer": answer_letter,
+            "benchmark": "sciqa",
+        })
+    if num_samples and num_samples < len(samples):
+        rng = np.random.RandomState(42)
+        idxs = rng.choice(len(samples), num_samples, replace=False)
+        samples = [samples[i] for i in idxs]
+    print(f"  Loaded {len(samples)} ScienceQA-IMG samples")
     return samples
 
 
@@ -459,6 +500,8 @@ def run_sweep(args):
             samples = load_aokvqa(args.num_samples, args.data_dir)
         elif bench_name == "mmmu":
             samples = load_mmmu(args.num_samples, args.data_dir)
+        elif bench_name == "sciqa":
+            samples = load_sciqa(args.num_samples, args.data_dir)
         else:
             print(f"Unknown benchmark: {bench_name}"); continue
 
@@ -818,7 +861,106 @@ def run_attention_analysis(args):
 
 
 # ════════════════════════════════════════════════════════════════
-# 10. MAIN
+# 10. EXPERIMENT: ABLATION – Random vs Attention Pruning (Paper Table 7)
+# ════════════════════════════════════════════════════════════════
+
+# Configs for ablation: compare attention-ranked vs random pruning.
+ABLATION_CONFIGS = [
+    {"K": 0,  "R_prune": 0.0,  "random": False, "label": "Baseline"},
+    {"K": 2,  "R_prune": 0.5,  "random": False, "label": "K=2,R=50% (attn)"},
+    {"K": 2,  "R_prune": 0.5,  "random": True,  "label": "K=2,R=50% (random)"},
+    {"K": 2,  "R_prune": 0.75, "random": False, "label": "K=2,R=75% (attn)"},
+    {"K": 2,  "R_prune": 0.75, "random": True,  "label": "K=2,R=75% (random)"},
+    {"K": 2,  "R_prune": 0.9,  "random": False, "label": "K=2,R=90% (attn)"},
+    {"K": 2,  "R_prune": 0.9,  "random": True,  "label": "K=2,R=90% (random)"},
+]
+
+
+def run_ablation(args):
+    """Ablation study: attention-ranked pruning vs random pruning.
+    Reproduces Paper Table 7, rows (b) vs (c)."""
+    model, processor = load_model_and_processor(
+        args.model_type, args.model_path, args.cache_dir,
+        getattr(args, "revision", None), getattr(args, "max_pixels", 401408),
+    )
+    out_dir = Path(args.results_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    bench_name = args.benchmark
+    print(f"\n{'='*60}")
+    print(f"  ABLATION: random vs attention pruning on {bench_name.upper()}")
+    print(f"  Model: {args.model_path}")
+    print(f"{'='*60}")
+
+    if bench_name == "aokvqa":
+        samples = load_aokvqa(args.num_samples, args.data_dir)
+    elif bench_name == "mmmu":
+        samples = load_mmmu(args.num_samples, args.data_dir)
+    elif bench_name == "sciqa":
+        samples = load_sciqa(args.num_samples, args.data_dir)
+    else:
+        print(f"Unknown benchmark: {bench_name}"); return
+
+    if not samples:
+        print("No samples loaded!"); return
+
+    # Estimate token counts for FLOPs
+    n_total, n_img = estimate_token_counts(
+        model, processor, args.model_type, samples
+    )
+    print(f"  Avg tokens: total={n_total}, image={n_img}")
+
+    results = []
+    for cfg in ABLATION_CONFIGS:
+        K, R_prune = cfg["K"], cfg["R_prune"]
+        random_pruning = cfg["random"]
+        label = cfg["label"]
+
+        set_fastv_params(model, args.model_type, K, R_prune,
+                         random_pruning=random_pruning)
+
+        print(f"\n  Config: {label}")
+        acc = evaluate(model, processor, args.model_type, samples, desc=label)
+
+        _, _, flops_ratio = compute_flops(
+            model.config, n_total, n_img, K, R_prune
+        )
+
+        results.append({
+            "label": label, "K": K, "R_prune": R_prune,
+            "random_pruning": random_pruning,
+            "accuracy": acc, "flops_ratio": flops_ratio,
+            "flops_reduction": round(1.0 - flops_ratio, 4),
+            "num_samples": len(samples),
+        })
+        print(f"    Accuracy: {acc}%  |  FLOPs ratio: {flops_ratio:.2%}")
+
+        gc.collect(); torch.cuda.empty_cache()
+
+    # Save
+    out_path = out_dir / f"ablation_{args.model_type}_{bench_name}.json"
+    payload = {
+        "model": args.model_path,
+        "model_type": args.model_type,
+        "benchmark": bench_name,
+        "n_total": n_total,
+        "n_img": n_img,
+        "configs": results,
+    }
+    with open(out_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    print(f"\n  Saved → {out_path}")
+
+    # Summary table
+    print(f"\n  {'Label':<28} {'Acc':>7} {'FLOPs%':>8}")
+    print(f"  {'-'*45}")
+    for r in results:
+        print(f"  {r['label']:<28} {r['accuracy']:>6.1f}% "
+              f"{r['flops_ratio']:>7.1%}")
+
+
+# ════════════════════════════════════════════════════════════════
+# 11. MAIN
 # ════════════════════════════════════════════════════════════════
 
 def main():
@@ -840,7 +982,7 @@ def main():
     p.add_argument("--model_path", required=True)
     p.add_argument("--revision", default=None, help="HF model revision (LLaVA)")
     p.add_argument("--benchmarks", nargs="+", default=["aokvqa"],
-                   choices=["aokvqa", "mmmu"])
+                   choices=["aokvqa", "mmmu", "sciqa"])
     p.add_argument("--num_samples", type=int, default=None,
                    help="Limit samples (None=full dataset)")
 
@@ -858,6 +1000,16 @@ def main():
     p.add_argument("--revision", default=None)
     p.add_argument("--num_samples", type=int, default=100)
 
+    # ── ablation ──
+    p = sub.add_parser("ablation", help="Random vs attention pruning (Table 7)")
+    p.add_argument("--model_type", required=True, choices=["qwen2vl", "llava"])
+    p.add_argument("--model_path", required=True)
+    p.add_argument("--revision", default=None)
+    p.add_argument("--benchmark", default="aokvqa",
+                   choices=["aokvqa", "mmmu", "sciqa"])
+    p.add_argument("--num_samples", type=int, default=None,
+                   help="Limit samples (None=full dataset)")
+
     args = parser.parse_args()
 
     if args.experiment == "sweep":
@@ -866,6 +1018,8 @@ def main():
         run_latency(args)
     elif args.experiment == "attention":
         run_attention_analysis(args)
+    elif args.experiment == "ablation":
+        run_ablation(args)
     else:
         parser.print_help()
 

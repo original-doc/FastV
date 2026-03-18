@@ -1289,8 +1289,13 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
                     if num_keep < num_vision:
                         # Rank vision tokens by attention score
                         vision_scores = scores[0, vision_indices]
-                        _, top_idx = torch.topk(vision_scores, num_keep)
-                        keep_vision = vision_indices[top_idx]
+                        # ── Random vs attention-based pruning (ablation) ──
+                        if getattr(self.config, "fastv_random_pruning", False):
+                            perm = torch.randperm(num_vision, device=vision_scores.device)[:num_keep]
+                            keep_vision = vision_indices[perm]
+                        else:
+                            _, top_idx = torch.topk(vision_scores, num_keep)
+                            keep_vision = vision_indices[top_idx]
 
                         # Combine with all text tokens and sort to preserve sequence order
                         keep_indices = torch.cat([text_indices, keep_vision])
