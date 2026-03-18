@@ -336,6 +336,120 @@ def plot_cross_model(results_dir, output_dir):
 
 
 # ════════════════════════════════════════════════════════════════
+# Ablation: Random vs Attention Pruning  (Paper Table 7)
+# ════════════════════════════════════════════════════════════════
+
+def plot_ablation(results_dir, output_dir):
+    """Grouped bar chart comparing attention-ranked vs random pruning."""
+    ablation_files = sorted(glob(str(Path(results_dir) / "ablation_*.json")))
+    if not ablation_files:
+        print("No ablation results found."); return
+
+    for fpath in ablation_files:
+        data = load_json(fpath)
+        model_name = data["model"].split("/")[-1]
+        bench = data["benchmark"]
+        configs = data["configs"]
+
+        # ── Figure A: Paired bar chart (attention vs random) ──
+        # Group configs by (K, R_prune) and separate attn vs random.
+        # Baseline is standalone; the rest come in pairs.
+        baseline = [c for c in configs if c["R_prune"] == 0.0]
+        paired = [c for c in configs if c["R_prune"] > 0.0]
+
+        # Build groups: each group is a (K, R_prune) pair
+        groups = {}
+        for c in paired:
+            key = (c["K"], c["R_prune"])
+            groups.setdefault(key, {})
+            kind = "random" if c["random_pruning"] else "attn"
+            groups[key][kind] = c
+
+        group_labels = []
+        attn_accs = []
+        rand_accs = []
+        for (K, R), pair in sorted(groups.items()):
+            group_labels.append(f"K={K}, R={int(R*100)}%")
+            attn_accs.append(pair.get("attn", {}).get("accuracy", 0))
+            rand_accs.append(pair.get("random", {}).get("accuracy", 0))
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+        x = np.arange(len(group_labels))
+        width = 0.35
+
+        bars_attn = ax.bar(x - width/2, attn_accs, width,
+                           label="Attention-ranked", color="#2196F3", alpha=0.85)
+        bars_rand = ax.bar(x + width/2, rand_accs, width,
+                           label="Random", color="#FF9800", alpha=0.75)
+
+        # Draw baseline as a horizontal line
+        if baseline:
+            bl_acc = baseline[0]["accuracy"]
+            ax.axhline(y=bl_acc, color="#4CAF50", linestyle="--", linewidth=1.5,
+                       label=f"Baseline ({bl_acc:.1f}%)", zorder=1)
+
+        # Value labels on bars
+        for bar, val in zip(bars_attn, attn_accs):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                    f"{val:.1f}", ha="center", va="bottom", fontsize=8)
+        for bar, val in zip(bars_rand, rand_accs):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                    f"{val:.1f}", ha="center", va="bottom", fontsize=8)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(group_labels, fontsize=10)
+        ax.set_ylabel("Accuracy (%)")
+        ax.set_title(f"{model_name} – {bench.upper()}: Attention vs Random Pruning")
+        ax.legend(loc="lower left")
+        ax.grid(axis="y", alpha=0.3)
+
+        out = Path(output_dir) / f"ablation_{data['model_type']}_{bench}.png"
+        fig.savefig(out, bbox_inches="tight")
+        print(f"  Saved {out}")
+        plt.close(fig)
+
+        # ── Figure B: Delta plot (accuracy drop from baseline) ──
+        if baseline:
+            bl_acc = baseline[0]["accuracy"]
+            fig, ax = plt.subplots(figsize=(10, 5))
+
+            attn_deltas = [a - bl_acc for a in attn_accs]
+            rand_deltas = [r - bl_acc for r in rand_accs]
+
+            bars_a = ax.bar(x - width/2, attn_deltas, width,
+                            label="Attention-ranked", color="#2196F3", alpha=0.85)
+            bars_r = ax.bar(x + width/2, rand_deltas, width,
+                            label="Random", color="#FF9800", alpha=0.75)
+
+            ax.axhline(y=0, color="black", linewidth=0.8)
+
+            for bar, val in zip(bars_a, attn_deltas):
+                offset = -0.5 if val < 0 else 0.3
+                ax.text(bar.get_x() + bar.get_width()/2,
+                        bar.get_height() + offset,
+                        f"{val:+.1f}", ha="center", va="bottom" if val >= 0 else "top",
+                        fontsize=8)
+            for bar, val in zip(bars_r, rand_deltas):
+                offset = -0.5 if val < 0 else 0.3
+                ax.text(bar.get_x() + bar.get_width()/2,
+                        bar.get_height() + offset,
+                        f"{val:+.1f}", ha="center", va="bottom" if val >= 0 else "top",
+                        fontsize=8)
+
+            ax.set_xticks(x)
+            ax.set_xticklabels(group_labels, fontsize=10)
+            ax.set_ylabel("Accuracy Change from Baseline (pp)")
+            ax.set_title(f"{model_name} – {bench.upper()}: Accuracy Drop by Pruning Strategy")
+            ax.legend(loc="lower left")
+            ax.grid(axis="y", alpha=0.3)
+
+            out = Path(output_dir) / f"ablation_delta_{data['model_type']}_{bench}.png"
+            fig.savefig(out, bbox_inches="tight")
+            print(f"  Saved {out}")
+            plt.close(fig)
+
+
+# ════════════════════════════════════════════════════════════════
 # MAIN
 # ════════════════════════════════════════════════════════════════
 
@@ -355,6 +469,7 @@ def main():
     plot_latency(args.results_dir, args.output_dir)
     plot_attention(args.results_dir, args.output_dir)
     plot_cross_model(args.results_dir, args.output_dir)
+    plot_ablation(args.results_dir, args.output_dir)
 
     print("\nDone!")
 
